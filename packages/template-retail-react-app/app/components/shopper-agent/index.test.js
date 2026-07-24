@@ -37,6 +37,15 @@ jest.mock('@salesforce/retail-react-app/app/components/shopper-agent/token-bridg
     callTokenBridge: (...args) => mockCallTokenBridge(...args)
 }))
 
+// Mock the Auth Link proxy browser helper (Commerce Client provider). The
+// Commerce Client auth-link flow calls this first (JWT -> auth_link_key) and
+// then hands the key to callTokenBridge.
+const mockCallAuthLinkProxy = jest.fn()
+jest.mock('@salesforce/retail-react-app/app/components/shopper-agent/auth-link-proxy', () => ({
+    __esModule: true,
+    callAuthLinkProxy: (...args) => mockCallAuthLinkProxy(...args)
+}))
+
 // Import ShopperAgent after all mocks are set up
 import ShopperAgent from '@salesforce/retail-react-app/app/components/shopper-agent/index'
 
@@ -226,6 +235,10 @@ describe('ShopperAgent Component', () => {
         // Default Token Bridge response: success
         mockCallTokenBridge.mockReset()
         mockCallTokenBridge.mockResolvedValue({status: 200, body: {ok: true}})
+
+        // Default Auth Link proxy response: success (Commerce Client provider)
+        mockCallAuthLinkProxy.mockReset()
+        mockCallAuthLinkProxy.mockResolvedValue({auth_link_key: 'test-auth-link-key'})
 
         mockShowToast.mockClear()
         mockFormatMessage.mockImplementation(
@@ -1666,6 +1679,224 @@ describe('ShopperAgent Component', () => {
 
             expect(widgetOptions.componentConfig.type).toBe('modal')
             expect(widgetOptions.componentConfig.options).toEqual({dialogPosition: 'top-left'})
+        })
+
+        describe('auth-link identity change survives remount', () => {
+            // The global test StorageMock (jest-setup.js) keeps every value under
+            // a single `.store` field, so Object.keys(sessionStorage) returns
+            // only ['store']. The component finds its keys with
+            // Object.keys(store).find((k) => k.startsWith(...)), which real
+            // browsers satisfy by enumerating own string keys. Mirror that by
+            // writing each key BOTH via setItem (so getItem returns it) and as an
+            // own enumerable property (so Object.keys enumerates it).
+            const trackedKeys = new Set()
+            const seedKey = (key, value) => {
+                window.sessionStorage.setItem(key, value)
+                window.sessionStorage[key] = value
+                trackedKeys.add(key)
+            }
+
+            // The Commerce Client widget writes the JWT to cim_af_ct_* and the
+            // conversationId to cim_af_conv_* before dispatching
+            // onCimulateWidgetReady. performAuthLink reads both, so seed them.
+            const seedWidgetStorage = () => {
+                seedKey(
+                    'cim_af_ct_test-org-id_My_Embedded_Service',
+                    JSON.stringify({accessToken: 'jwt.token.here', lastEventId: '1', storedAt: 1})
+                )
+                seedKey(
+                    'cim_af_conv_test-org-id_My_Embedded_Service',
+                    JSON.stringify({conversationId: 'conv-123', storedAt: 1})
+                )
+            }
+
+            const fireWidgetReady = async () => {
+                await act(async () => {
+                    window.dispatchEvent(new Event('onCimulateWidgetReady'))
+                })
+            }
+
+            afterEach(() => {
+                // StorageMock.clear() resets .store; also drop the own enumerable
+                // keys we added so they do not leak into other tests.
+                window.sessionStorage.clear()
+                window.localStorage.clear()
+                trackedKeys.forEach((key) => {
+                    delete window.sessionStorage[key]
+                })
+                trackedKeys.clear()
+            })
+
+            test('re-links a RESUMED conversation on the login remount (no widget-ready)', async () => {
+                // The real login flow: a guest conversation already exists in
+                // storage. On login the component unmounts (basket refetch) then
+                // remounts as `registered`. The widget RESUMES the conversation,
+                // so it does NOT fire onCimulateWidgetReady — the initial-mount
+                // path of Trigger 2 is the only thing that can (re)link, and it
+                // must, because a resumed conversation is present.
+                seedWidgetStorage()
+
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'guest',
+                    isGuest: true,
+                    isRegistered: false,
+                    isExternal: false
+                })
+                const {rerender} = renderCommerceClient()
+                // Guest mount with a resumed conversation -> link once.
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(1))
+
+                // Basket refetch on login unmounts the widget window.
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={false}
+                        />
+                    )
+                })
+                expect(screen.queryByTestId('commerce-client-agent-widget')).toBeNull()
+
+                // Login completes: registered shopper, basket resolves, widget
+                // remounts and resumes the same conversation (no widget-ready).
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'registered',
+                    isGuest: false,
+                    isRegistered: true,
+                    isExternal: false
+                })
+                mockedUseUsid.mockReturnValue({usid: 'registered-usid'})
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={true}
+                        />
+                    )
+                })
+
+                // Re-linked to the now-registered shopper.
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(2))
+            })
+
+            test('does NOT re-link on a remount with no identity change', async () => {
+                seedWidgetStorage()
+
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'guest',
+                    isGuest: true,
+                    isRegistered: false,
+                    isExternal: false
+                })
+                const {rerender} = renderCommerceClient()
+                // Resumed conversation on mount -> link once.
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(1))
+
+                // Unmount then remount as the SAME guest identity (e.g. a
+                // transient basket refetch unrelated to auth).
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={false}
+                        />
+                    )
+                })
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={true}
+                        />
+                    )
+                })
+
+                // Same conversation + same identity -> dedup key matches -> no
+                // redundant token-bridge call beyond the initial link.
+                await waitFor(() => {})
+                expect(mockCallTokenBridge).toHaveBeenCalledTimes(1)
+            })
+
+            test('does NOT link on a cold start with no conversation yet', async () => {
+                // Genuine first visit: no cim_af_conv_* in storage. The widget
+                // will CREATE a conversation and fire onCimulateWidgetReady
+                // (Trigger 1) to link it; the initial-mount path of Trigger 2
+                // must NOT link, since there is nothing to link yet.
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'guest',
+                    isGuest: true,
+                    isRegistered: false,
+                    isExternal: false
+                })
+                renderCommerceClient()
+
+                await waitFor(() => {})
+                expect(mockCallTokenBridge).not.toHaveBeenCalled()
+
+                // The widget then creates the conversation and fires widget-ready.
+                seedWidgetStorage()
+                await fireWidgetReady()
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(1))
+            })
+
+            test('re-links on remount when useScript reports not-loaded but the bundle global exists', async () => {
+                // Reproduces the real-browser failure: `useScript` only reports
+                // `{loaded: true}` when it CREATES the <script> tag. On the
+                // login/logout remount the tag already exists, so useScript
+                // stays `{loaded: false}` for the remounted component. Both
+                // auth-link triggers gate on readiness, so without the
+                // window.CimulateMessaging fallback the identity-change re-link
+                // would never fire. The bundle global persists across remounts.
+                seedWidgetStorage()
+                window.CimulateMessaging = {injectMessagingWidget: jest.fn()}
+
+                // First mount: script is freshly created -> loaded true, guest,
+                // resumed conversation -> link once.
+                mockedUseScript.mockReturnValue({loaded: true, error: false})
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'guest',
+                    isGuest: true,
+                    isRegistered: false,
+                    isExternal: false
+                })
+                const {rerender} = renderCommerceClient()
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(1))
+
+                // Basket refetch on login unmounts the widget window.
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={false}
+                        />
+                    )
+                })
+
+                // Remount after login: the <script> is already on the page, so
+                // useScript never transitions to loaded for the new instance.
+                mockedUseScript.mockReturnValue({loaded: false, error: false})
+                mockedUseCustomerType.mockReturnValue({
+                    customerType: 'registered',
+                    isGuest: false,
+                    isRegistered: true,
+                    isExternal: false
+                })
+                mockedUseUsid.mockReturnValue({usid: 'registered-usid'})
+                await act(async () => {
+                    rerender(
+                        <ShopperAgent
+                            commerceAgentConfiguration={commerceClientSettings}
+                            basketDoneLoading={true}
+                        />
+                    )
+                })
+
+                // The window.CimulateMessaging fallback lets the identity-change
+                // trigger run despite scriptLoadStatus.loaded being false.
+                await waitFor(() => expect(mockCallTokenBridge).toHaveBeenCalledTimes(2))
+
+                delete window.CimulateMessaging
+            })
         })
     })
 })

@@ -614,7 +614,6 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
         esDeveloperName,
         embeddedServiceName,
         capabilitiesVersion = DEFAULT_COMMERCE_CLIENT_CAPABILITIES_VERSION,
-        commerceClientScriptSourceUrl,
         commerceClientMode = 'messaging',
         commerceClientLogoUrl,
         headerText,
@@ -658,11 +657,52 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
     const identityRef = useRef({usid, customerType})
     identityRef.current = {usid, customerType}
 
+    // Namespaced sessionStorage key that PERSISTS the last successful auth-link
+    // across component remounts. <ShopperAgent> gates rendering on
+    // `basketDoneLoading` (dataUpdatedAt > 0) and `isConfigurationsLoading`;
+    // on login/logout the basket query restarts (customerId is part of its
+    // React Query key) so `dataUpdatedAt` momentarily returns to 0, the gate
+    // fails, and CommerceClientAgentWindow UNMOUNTS — wiping every useRef. If
+    // the last-linked state lived only in memory, the remounted component would
+    // reset `prevSlasIdentityRef` to undefined and could not tell a fresh mount
+    // apart from a login transition. Persisting to sessionStorage lets the
+    // remounted component seed `prevSlasIdentityRef` with the previous identity
+    // and detect the change. Note logout additionally clears site storage
+    // (Clear-Site-Data), so on logout this record is gone and the remount is
+    // handled by the resumed-conversation branch / Trigger 1 instead.
+    const authLinkStorageKey = `cim_af_authlink_${salesforceOrgId}_${
+        esDeveloperName || embeddedServiceName
+    }`
+
+    const readPersistedAuthLink = () => {
+        if (typeof window === 'undefined') return null
+        try {
+            const raw = window.sessionStorage.getItem(authLinkStorageKey)
+            return raw ? JSON.parse(raw) : null
+        } catch (err) {
+            console.error('[Commerce Client] Failed to read persisted auth link', err)
+            return null
+        }
+    }
+
+    const persistAuthLink = ({linkKey, slasIdentity}) => {
+        if (typeof window === 'undefined') return
+        try {
+            window.sessionStorage.setItem(
+                authLinkStorageKey,
+                JSON.stringify({linkKey, slasIdentity})
+            )
+        } catch (err) {
+            console.error('[Commerce Client] Failed to persist auth link', err)
+        }
+    }
+
     // Composite dedup key of the last SUCCESSFUL link: `${conversationId}:${slasIdentity}`.
     // Tracks *whose* identity is linked to *which* conversation, so redundant
     // re-opens are skipped while a genuine identity change on either side
-    // still re-links.
-    const lastAuthLinkKeyRef = useRef(null)
+    // still re-links. Seeded from sessionStorage so a remount (see above) still
+    // knows what was already linked.
+    const lastAuthLinkKeyRef = useRef(readPersistedAuthLink()?.linkKey ?? null)
 
     // Resolve the bundle URL from the configured loading mode: the external
     // Cimulate CDN ('cdn', default) or this app's own bundled static assets
@@ -671,6 +711,28 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
 
     // Load the Commerce Client messaging UMD bundle, which exposes window.CimulateMessaging
     const scriptLoadStatus = useScript(commerceClientScriptUrl)
+
+    /**
+     * Whether the Commerce Client bundle is usable.
+     *
+     * `scriptLoadStatus` is NOT reliable across component remounts: `useScript`
+     * only transitions to `{loaded: true}` when it is the one that CREATES the
+     * <script> tag. On login/logout the basket query key rotates, the render
+     * gate briefly fails, and this component UNMOUNTS then remounts. On that
+     * remount the <script src=...> is already on the page, so `useScript` skips
+     * its creation branch and never re-fires `load` — `scriptLoadStatus` stays
+     * `{loaded: false}` forever, and every effect gated on it (both auth-link
+     * triggers and widget injection) would silently no-op.
+     *
+     * The bundle sets `window.CimulateMessaging` when it executes, and that
+     * global persists across remounts, so we treat it as an equivalent
+     * ready signal. Called inside effects (not memoized) because the global is
+     * populated imperatively and is not a React-reactive value; the effects that
+     * use it already re-run on `scriptLoadStatus` / identity changes.
+     */
+    const isCommerceClientBundleReady = () =>
+        (scriptLoadStatus?.loaded && !scriptLoadStatus?.error) ||
+        (onClient && !!window.CimulateMessaging)
 
     // =====================================================================
     // Auth-link flow (identity-change driven).
@@ -797,7 +859,9 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
             const conversationId = readConversationId()
             const linkKey = `${conversationId || 'unknown'}:${slasIdentity}`
             if (lastAuthLinkKeyRef.current === linkKey) {
-                console.log(`[Commerce Client] performAuthLink(${reason}): already linked (${linkKey})`)
+                console.log(
+                    `[Commerce Client] performAuthLink(${reason}): already linked (${linkKey})`
+                )
                 return
             }
 
@@ -813,8 +877,7 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
                 commerceClientJWT,
                 siteId: sid
             })
-            const authLinkKey =
-                authLinkResponse?.auth_link_key || authLinkResponse?.authLinkKey
+            const authLinkKey = authLinkResponse?.auth_link_key || authLinkResponse?.authLinkKey
             if (!authLinkKey || typeof authLinkKey !== 'string') {
                 console.error(
                     `[Commerce Client] performAuthLink(${reason}): no auth link key`,
@@ -839,6 +902,7 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
             }
 
             lastAuthLinkKeyRef.current = linkKey
+            persistAuthLink({linkKey, slasIdentity})
             console.log(`[Commerce Client] performAuthLink(${reason}): linked (${linkKey})`)
         } catch (error) {
             console.error(`[Commerce Client] performAuthLink(${reason}) threw`, error)
@@ -864,7 +928,7 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
      * new conversation's token to land.
      */
     useEffect(() => {
-        if (!scriptLoadStatus?.loaded || scriptLoadStatus?.error) {
+        if (!isCommerceClientBundleReady()) {
             return
         }
         const handleWidgetReady = () => {
@@ -885,24 +949,54 @@ const CommerceClientAgentWindow = ({commerceAgentConfiguration}) => {
      * re-link. Skips the initial mount; the composite dedup key in
      * performAuthLink prevents a redundant link if nothing effectively changed.
      */
-    const prevSlasIdentityRef = useRef(undefined)
+    // Seed from the persisted last-linked identity so identity-change detection
+    // survives the login/logout remount described above. `prev` is undefined
+    // only when nothing was linked yet OR the persisted record was wiped (e.g.
+    // logout's Clear-Site-Data). This is the primary LOGIN path: login does not
+    // clear storage, so after the remount `prev` is the identity we were linked
+    // as (e.g. "guest") and the guest->registered transition is detected here
+    // instead of being swallowed as an "initial mount". The `prev === undefined`
+    // branch below is the complementary safety net for the cases this seed
+    // cannot cover (resumed conversation with no surviving link record).
+    const prevSlasIdentityRef = useRef(readPersistedAuthLink()?.slasIdentity ?? undefined)
     useEffect(() => {
-        if (!scriptLoadStatus?.loaded || scriptLoadStatus?.error) {
+        if (!isCommerceClientBundleReady()) {
             return
         }
         const identity = getSlasIdentity()
         const prev = prevSlasIdentityRef.current
         prevSlasIdentityRef.current = identity
 
-        // Skip initial mount — the widget-ready trigger handles first link.
+        // Initial mount (prev === undefined). Login/logout UNMOUNTS then
+        // remounts this component (the basket query key rotates on identity
+        // change, the render gate briefly fails), so a real guest<->registered
+        // transition is split across two component instances and arrives here
+        // looking like a fresh mount. We therefore cannot blindly skip:
+        //
+        //   - If a conversation already exists in storage, the widget RESUMED it
+        //     (it only fires onCimulateWidgetReady for BRAND-NEW conversations),
+        //     so Trigger 1 will NOT link it. This is exactly the login case
+        //     (login does not clear storage): the resumed conversation must be
+        //     (re)linked to the now-current shopper. performAuthLink is deduped
+        //     by `${conversationId}:${slasIdentity}`, so a redundant call when
+        //     the identity is unchanged is a cheap no-op.
+        //   - If no conversation exists yet, it is a genuine cold start; the
+        //     widget will create one and Trigger 1 handles that first link.
         if (prev === undefined) {
+            if (readConversationId()) {
+                console.log(
+                    `[Commerce Client] initial mount with resumed conversation (${identity}) -> auth link`
+                )
+                performAuthLinkRef.current({reason: 'resumed-conversation'})
+            }
             return
         }
         if (prev !== identity) {
-            console.log(`[Commerce Client] SLAS identity change (${prev} -> ${identity}) -> auth link`)
+            console.log(
+                `[Commerce Client] SLAS identity change (${prev} -> ${identity}) -> auth link`
+            )
             performAuthLinkRef.current({reason: 'slas-identity-change'})
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [customerType, usid, scriptLoadStatus])
 
     // In 'panel' mode we render the widget as a 'dialog' docked to the right and
