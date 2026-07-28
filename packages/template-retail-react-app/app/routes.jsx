@@ -139,7 +139,7 @@ export default () => {
     const socialRedirectURI = loginConfig?.social?.redirectURI
     const passwordlessLoginEnabled = loginConfig?.passwordless?.enabled
     const passwordlessLoginLandingPath = loginConfig?.passwordless?.landingPath
-    const guestOrderAccessEnabled = getConfig()?.app?.guestOrderAccess?.enabled
+    const guestOrderLookupEnabled = getConfig()?.app?.guestOrderLookup?.enabled
 
     // Add dynamic routes conditionally (only if features are enabled and paths are defined)
     const dynamicRoutes = [
@@ -160,18 +160,18 @@ export default () => {
                 component: SocialLoginRedirect,
                 exact: true
             },
-        guestOrderAccessEnabled && {
-            path: '/order-access',
+        guestOrderLookupEnabled && {
+            path: '/order-lookup',
             component: GuestOrderAccessRequest,
             exact: true
         },
-        guestOrderAccessEnabled && {
-            path: '/order-access/verify',
+        guestOrderLookupEnabled && {
+            path: '/order-lookup/verify',
             component: GuestOrderAccessVerify,
             exact: true
         },
-        guestOrderAccessEnabled && {
-            path: '/order-access/order',
+        guestOrderLookupEnabled && {
+            path: '/order-lookup/order',
             component: GuestOrderAccessOrder,
             exact: true
         }
